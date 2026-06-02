@@ -1,8 +1,6 @@
 # cquant_exercise
 
-# Generate README.md for cquant_exercise repository
-
-readme = """# cQuant Energy Analyst Programming Exercise
+# cQuant Energy Analyst Programming Exercise
 **Candidate:** Luis  
 **Data:** ERCOT Day-Ahead Hourly Settlement Point Prices, 2016–2019  
 **Language:** Python 3  
