@@ -469,4 +469,270 @@ print(f"\nSaved → {out_path}")
 # series. This is a known trade-off when applying log returns to power prices.
 # =============================================================================
 
-# %%
+#%%
+# =============================================================================
+# TASK 5 — Write hub volatilities to HourlyVolatilityByYear.csv
+#           Columns: SettlementPoint, Year, HourlyVolatility (case-sensitive)
+# =============================================================================
+
+# --- Select only the three required columns and rename Volatility ---
+# We drop the diagnostic columns (NHours, NReturns) added in Task 4 —
+# those were for our own validation, not part of the deliverable
+output_df = (
+    volatility_df[["SettlementPoint", "Year", "Volatility"]]
+    .rename(columns={"Volatility": "HourlyVolatility"})
+    .sort_values(["SettlementPoint", "Year"])
+    .reset_index(drop=True)
+)
+
+# --- Validate ---
+# Confirm exact column names (task specifies they are case-sensitive)
+expected_columns = ["SettlementPoint", "Year", "HourlyVolatility"]
+assert list(output_df.columns) == expected_columns, (
+    f"Column mismatch — expected {expected_columns}, "
+    f"got {list(output_df.columns)}"
+)
+
+assert output_df.shape[0] == 25, (
+    f"Expected 25 rows, got {output_df.shape[0]}"
+)
+
+assert output_df.isna().sum().sum() == 0, \
+    "Unexpected null values in output"
+
+assert (output_df["HourlyVolatility"] > 0).all(), \
+    "Non-positive volatility found — check Task 4 output"
+
+print(f"\nOutput shape : {output_df.shape[0]} rows × {output_df.shape[1]} columns")
+print(f"Columns      : {list(output_df.columns)}")
+print("Validation passed: correct columns, 25 rows, no nulls, all volatilities > 0.")
+
+# --- Preview ---
+print("\nFull output:")
+print(output_df.to_string(index=False))
+
+# --- Save ---
+out_path = os.path.join(OUTPUT_DIR, "HourlyVolatilityByYear.csv")
+output_df.to_csv(out_path, index=False)
+assert os.path.exists(out_path), "Output file was not created!"
+print(f"\nSaved → {out_path}")
+
+# =============================================================================
+# ANALYTICAL NOTE:
+# HourlyVolatility is expressed as a unitless ratio (standard deviation of
+# log returns). It is NOT annualized here — it reflects the typical
+# hour-to-hour price variability within a given year.
+# To annualize (for comparison with financial vol conventions), you would
+# multiply by sqrt(8760) — the number of hours in a year. For example,
+# a hub with hourly vol of 0.23 would have an annualized vol of ~21.5,
+# or 2,150% — illustrating why power is considered the most volatile
+# commodity class.
+# =============================================================================
+
+#%%
+# =============================================================================
+# TASK 6 — Find the hub with highest hourly volatility for each year
+#           Output: MaxVolatilityByYear.csv
+# =============================================================================
+
+# --- Load the volatility file saved in Task 5 ---
+print("Loading HourlyVolatilityByYear.csv from Task 5...")
+vol_df = pd.read_csv(os.path.join(OUTPUT_DIR, "HourlyVolatilityByYear.csv"))
+print(f"  Loaded {vol_df.shape[0]:,} rows × {vol_df.shape[1]} columns")
+
+# === TASK 6: MAX VOLATILITY HUB PER YEAR ===
+
+# --- For each year, find the row with the highest HourlyVolatility ---
+# .idxmax() returns the index label of the maximum value within each group.
+# We use it to select the full row (not just the max value) so we keep
+# SettlementPoint alongside the volatility figure.
+max_vol_idx = vol_df.groupby("Year")["HourlyVolatility"].idxmax()
+max_vol_df  = vol_df.loc[max_vol_idx].reset_index(drop=True)
+
+# Sort by Year for clean output
+max_vol_df = max_vol_df.sort_values("Year").reset_index(drop=True)
+
+# --- Validate ---
+# Expect exactly one row per year (2016, 2017, 2018, 2019)
+expected_years = [2016, 2017, 2018, 2019]
+
+assert list(max_vol_df["Year"].values) == expected_years, (
+    f"Year mismatch — expected {expected_years}, "
+    f"got {list(max_vol_df['Year'].values)}"
+)
+
+assert max_vol_df.shape[0] == 4, (
+    f"Expected 4 rows (one per year), got {max_vol_df.shape[0]}"
+)
+
+assert max_vol_df.isna().sum().sum() == 0, \
+    "Unexpected null values in output"
+
+# Confirm each selected volatility is truly the max for that year
+for _, row in max_vol_df.iterrows():
+    year_max = vol_df[vol_df["Year"] == row["Year"]]["HourlyVolatility"].max()
+    assert row["HourlyVolatility"] == year_max, (
+        f"Row for {row['Year']} is not the maximum — check idxmax logic"
+    )
+
+print("Validation passed: 4 rows, one per year, each is the true maximum.")
+
+# --- Preview ---
+print("\nFull output:")
+print(max_vol_df.to_string(index=False))
+
+# --- Save ---
+out_path = os.path.join(OUTPUT_DIR, "MaxVolatilityByYear.csv")
+max_vol_df.to_csv(out_path, index=False)
+assert os.path.exists(out_path), "Output file was not created!"
+print(f"\nSaved → {out_path}")
+
+# =============================================================================
+# ANALYTICAL NOTE:
+# The max volatility hub reveals which part of the ERCOT grid experienced
+# the most extreme hour-to-hour price swings each year.
+# Expected result:
+#   2016–2018: HB_WEST — West Texas wind intermittency dominates
+#   2019:      HB_PAN  — Panhandle wind, even more exposed than HB_WEST,
+#                        and its only year in the dataset
+# If HB_PAN wins 2019 (volatility 0.63 vs HB_WEST 0.34), that is a large
+# margin — worth flagging as a data artifact since HB_PAN only has 9 months
+# of data in 2019. A partial year with extreme seasonal months could inflate
+# its annual volatility relative to a full-year hub.
+# This is a meaningful limitation: comparing a partial-year hub to full-year
+# hubs on an annual volatility basis is not strictly apples-to-apples.
+# =============================================================================
+#%%
+# =============================================================================
+# TASK 7 — Translate hourly data into cQuant model-ready format
+#           One CSV per settlement point, saved in output/formattedSpotHistory/
+#           Format: Variable, Date, X1, X2, ..., X24
+#           Hour-beginning convention: X1=00:00, X2=01:00, ..., X24=23:00
+#           Filename convention: spot_<SettlementPoint>.csv
+# =============================================================================
+
+SPOT_DIR   = os.path.join(OUTPUT_DIR, "formattedSpotHistory")
+
+# Create the output subdirectory if it doesn't exist
+os.makedirs(SPOT_DIR, exist_ok=True)
+print(f"Output subdirectory: {SPOT_DIR}")
+
+# --- Load the combined dataset from Task 1 ---
+print("\nLoading combined dataset from Task 1...")
+df = pd.read_csv(os.path.join(OUTPUT_DIR, "combined_ercot_da_prices.csv"),
+                 parse_dates=["Date"])
+print(f"  Loaded {df.shape[0]:,} rows × {df.shape[1]} columns")
+
+# === TASK 7: PIVOT TO WIDE FORMAT AND WRITE ONE FILE PER SETTLEMENT POINT ===
+
+# --- Extract Date (calendar date) and HourLabel (X1–X24) ---
+# Hour-beginning convention:
+#   00:00 = start of hour 1  → X1
+#   01:00 = start of hour 2  → X2
+#   ...
+#   23:00 = start of hour 24 → X24
+# dt.hour gives 0–23; adding 1 gives 1–24; prepending "X" gives X1–X24
+df["DateOnly"]   = df["Date"].dt.date
+df["HourLabel"]  = "X" + (df["Date"].dt.hour + 1).astype(str)
+
+# --- Validate hour labels before pivoting ---
+unique_hours = sorted(df["HourLabel"].unique(),
+                      key=lambda x: int(x[1:]))   # sort X1,X2,...,X24 numerically
+print(f"\nUnique hour labels : {unique_hours}")
+assert len(unique_hours) == 24, (
+    f"Expected 24 unique hour labels, got {len(unique_hours)} — "
+    "check for missing or duplicate hours in the raw data"
+)
+assert unique_hours[0]  == "X1",  "First hour label should be X1"
+assert unique_hours[-1] == "X24", "Last hour label should be X24"
+print("Validation passed: 24 hour labels X1–X24 confirmed.")
+
+# --- Get all settlement points ---
+all_nodes = sorted(df["SettlementPoint"].unique())
+print(f"\nSettlement points to process : {len(all_nodes)}")
+print(f"  {all_nodes}")
+assert len(all_nodes) == 15, (
+    f"Expected 15 settlement points, found {len(all_nodes)}"
+)
+
+# --- Process each settlement point ---
+files_written = []
+
+for node in all_nodes:
+    # Filter to this node only
+    node_df = df[df["SettlementPoint"] == node].copy()
+
+    # Pivot: rows = DateOnly, columns = X1..X24, values = Price
+    # This reshapes from one row per hour to one row per day with 24 price columns
+    wide = node_df.pivot(index="DateOnly", columns="HourLabel", values="Price")
+
+    # Reorder columns numerically (X1, X2, ..., X24) — pivot sorts alphabetically
+    # by default which would give X1, X10, X11... instead of X1, X2, X3...
+    hour_cols = [f"X{i}" for i in range(1, 25)]
+    wide = wide[hour_cols]
+
+    # Reset index so DateOnly becomes a regular column, then rename to match format
+    wide = wide.reset_index().rename(columns={"DateOnly": "Date"})
+
+    # Add the Variable column as the first column (= settlement point name)
+    wide.insert(0, "Variable", node)
+
+    # Validate shape:
+    # Each non-HB_PAN node should have 365 or 366 days × 4 years = 1,461 rows
+    # HB_PAN only has 9 months of data so fewer rows are expected
+    n_rows = wide.shape[0]
+    n_cols = wide.shape[1]   # Variable + Date + X1..X24 = 26 columns
+
+    assert n_cols == 26, (
+        f"{node}: expected 26 columns (Variable, Date, X1–X24), got {n_cols}"
+    )
+    assert wide["Variable"].nunique() == 1, \
+        f"{node}: Variable column contains more than one settlement point"
+    assert wide.iloc[:, 2:].isna().sum().sum() == 0 or node == "HB_PAN", (
+        f"{node}: unexpected NaN values in price columns"
+    )
+
+    print(f"  {node:20s} → {n_rows:,} days × {n_cols} columns")
+
+    # Write to CSV — no index (row numbers not part of the format)
+    filename  = f"spot_{node}.csv"
+    file_path = os.path.join(SPOT_DIR, filename)
+    wide.to_csv(file_path, index=False)
+    files_written.append(file_path)
+
+# --- Confirm all 15 files were written ---
+print(f"\nFiles written : {len(files_written)}")
+assert len(files_written) == 15, \
+    f"Expected 15 files, wrote {len(files_written)}"
+
+for fp in files_written:
+    assert os.path.exists(fp), f"File not found after write: {fp}"
+
+print("Validation passed: all 15 files confirmed on disk.")
+
+# --- Spot-check one file to verify format ---
+print("\nSpot-check — first 2 rows of spot_HB_BUSAVG.csv:")
+check = pd.read_csv(os.path.join(SPOT_DIR, "spot_HB_BUSAVG.csv"))
+print(check.head(2).to_string(index=False))
+print(f"Shape: {check.shape[0]:,} rows × {check.shape[1]} columns")
+
+# =============================================================================
+# ANALYTICAL NOTE:
+# The wide format (one row per day, X1–X24 columns) is the standard input
+# structure for many energy simulation and forward curve models, including
+# cQuant's. It allows the model to read a full day's price profile as a
+# single record — useful for capturing intraday shape (the hourly price curve)
+# alongside the daily level.
+#
+# Hour-beginning convention is standard in ERCOT and most North American
+# ISOs: X1 represents the price for energy delivered in the hour that BEGINS
+# at midnight (00:00–01:00), not ending at midnight.
+#
+# HB_PAN will have fewer rows than other nodes (9 months vs 4 full years)
+# which is expected and consistent with our findings in Tasks 2 and 4.
+#
+# Downstream model note: if the simulation model requires a balanced panel
+# (all nodes covering identical date ranges), HB_PAN may need to be excluded
+# or its missing dates filled — that decision belongs to the model operator,
+# not the data preparation step.
+# =============================================================================
