@@ -602,7 +602,7 @@ print(f"\nSaved → {out_path}")
 # This is a meaningful limitation: comparing a partial-year hub to full-year
 # hubs on an annual volatility basis is not strictly apples-to-apples.
 # =============================================================================
-#%%
+
 # =============================================================================
 # TASK 7 — Translate hourly data into cQuant model-ready format
 #           One CSV per settlement point, saved in output/formattedSpotHistory/
@@ -610,10 +610,30 @@ print(f"\nSaved → {out_path}")
 #           Hour-beginning convention: X1=00:00, X2=01:00, ..., X24=23:00
 #           Filename convention: spot_<SettlementPoint>.csv
 # =============================================================================
+#%%
+df = pd.read_csv(os.path.join(OUTPUT_DIR, "combined_ercot_da_prices.csv"),
+                 parse_dates=["Date"])
 
+df["DateOnly"]  = df["Date"].dt.date
+df["HourLabel"] = "X" + (df["Date"].dt.hour + 1).astype(str)
+
+# Check every node for missing hours on any given day
+for node in sorted(df["SettlementPoint"].unique()):
+    node_df = df[df["SettlementPoint"] == node]
+    
+    # Count hours per day — should always be 24
+    hours_per_day = node_df.groupby("DateOnly")["HourLabel"].count()
+    bad_days = hours_per_day[hours_per_day != 24]
+    
+    if len(bad_days) > 0:
+        print(f"{node}: {len(bad_days)} days with != 24 hours")
+        print(bad_days.to_string())
+        print()
+    else:
+        print(f"{node}: OK — all days have exactly 24 hours")
+#%%
 SPOT_DIR   = os.path.join(OUTPUT_DIR, "formattedSpotHistory")
 
-# Create the output subdirectory if it doesn't exist
 os.makedirs(SPOT_DIR, exist_ok=True)
 print(f"Output subdirectory: {SPOT_DIR}")
 
@@ -625,92 +645,100 @@ print(f"  Loaded {df.shape[0]:,} rows × {df.shape[1]} columns")
 
 # === TASK 7: PIVOT TO WIDE FORMAT AND WRITE ONE FILE PER SETTLEMENT POINT ===
 
-# --- Extract Date (calendar date) and HourLabel (X1–X24) ---
-# Hour-beginning convention:
-#   00:00 = start of hour 1  → X1
-#   01:00 = start of hour 2  → X2
-#   ...
-#   23:00 = start of hour 24 → X24
-# dt.hour gives 0–23; adding 1 gives 1–24; prepending "X" gives X1–X24
-df["DateOnly"]   = df["Date"].dt.date
-df["HourLabel"]  = "X" + (df["Date"].dt.hour + 1).astype(str)
+# --- Extract Date and HourLabel (X1–X24) ---
+# Hour-beginning: 00:00 → X1, 01:00 → X2, ..., 23:00 → X24
+df["DateOnly"]  = df["Date"].dt.date
+df["HourLabel"] = "X" + (df["Date"].dt.hour + 1).astype(str)
 
-# --- Validate hour labels before pivoting ---
-unique_hours = sorted(df["HourLabel"].unique(),
-                      key=lambda x: int(x[1:]))   # sort X1,X2,...,X24 numerically
-print(f"\nUnique hour labels : {unique_hours}")
-assert len(unique_hours) == 24, (
-    f"Expected 24 unique hour labels, got {len(unique_hours)} — "
-    "check for missing or duplicate hours in the raw data"
-)
-assert unique_hours[0]  == "X1",  "First hour label should be X1"
-assert unique_hours[-1] == "X24", "Last hour label should be X24"
-print("Validation passed: 24 hour labels X1–X24 confirmed.")
+# --- Identify DST spring-forward days (23-hour days) ---
+# These are the 4 days per year where clocks jump 02:00 → 03:00
+# X3 (the 02:00 hour) will be NaN on these days — this is correct
+hours_per_day = df.groupby(["SettlementPoint", "DateOnly"])["HourLabel"].count()
+dst_days = hours_per_day[hours_per_day == 23].reset_index()["DateOnly"].unique()
+print(f"\nDST spring-forward days found (23-hour days): {len(dst_days)}")
+for d in sorted(dst_days):
+    print(f"  {d}")
 
 # --- Get all settlement points ---
 all_nodes = sorted(df["SettlementPoint"].unique())
 print(f"\nSettlement points to process : {len(all_nodes)}")
-print(f"  {all_nodes}")
-assert len(all_nodes) == 15, (
+assert len(all_nodes) == 15, \
     f"Expected 15 settlement points, found {len(all_nodes)}"
-)
 
 # --- Process each settlement point ---
 files_written = []
+hour_cols = [f"X{i}" for i in range(1, 25)]   # X1, X2, ..., X24
 
 for node in all_nodes:
     # Filter to this node only
     node_df = df[df["SettlementPoint"] == node].copy()
 
     # Pivot: rows = DateOnly, columns = X1..X24, values = Price
-    # This reshapes from one row per hour to one row per day with 24 price columns
     wide = node_df.pivot(index="DateOnly", columns="HourLabel", values="Price")
 
-    # Reorder columns numerically (X1, X2, ..., X24) — pivot sorts alphabetically
-    # by default which would give X1, X10, X11... instead of X1, X2, X3...
-    hour_cols = [f"X{i}" for i in range(1, 25)]
-    wide = wide[hour_cols]
+    # Reorder columns numerically (X1, X2, ..., X24)
+    # pivot() sorts alphabetically by default: X1, X10, X11 ... X9
+    wide = wide.reindex(columns=hour_cols)
 
-    # Reset index so DateOnly becomes a regular column, then rename to match format
+    # Reset index and rename DateOnly → Date
     wide = wide.reset_index().rename(columns={"DateOnly": "Date"})
 
-    # Add the Variable column as the first column (= settlement point name)
+    # Insert Variable as the first column
     wide.insert(0, "Variable", node)
 
-    # Validate shape:
-    # Each non-HB_PAN node should have 365 or 366 days × 4 years = 1,461 rows
-    # HB_PAN only has 9 months of data so fewer rows are expected
     n_rows = wide.shape[0]
-    n_cols = wide.shape[1]   # Variable + Date + X1..X24 = 26 columns
+    n_cols = wide.shape[1]   # 26: Variable + Date + X1..X24
 
+    # --- Validate shape ---
     assert n_cols == 26, (
-        f"{node}: expected 26 columns (Variable, Date, X1–X24), got {n_cols}"
+        f"{node}: expected 26 columns, got {n_cols}"
     )
     assert wide["Variable"].nunique() == 1, \
         f"{node}: Variable column contains more than one settlement point"
-    assert wide.iloc[:, 2:].isna().sum().sum() == 0 or node == "HB_PAN", (
-        f"{node}: unexpected NaN values in price columns"
-    )
 
-    print(f"  {node:20s} → {n_rows:,} days × {n_cols} columns")
+    # --- Validate NaNs ---
+    # Only X3 on DST spring-forward days should be NaN — nothing else
+    nan_counts = wide.iloc[:, 2:].isna().sum()   # sum NaNs per hour column
+    nan_cols   = nan_counts[nan_counts > 0]
 
-    # Write to CSV — no index (row numbers not part of the format)
+    if len(nan_cols) > 0:
+        # X3 NaNs are expected — count should equal number of DST days
+        # For HB_PAN (partial year) DST days may fall outside its date range
+        date_min = pd.to_datetime(wide["Date"]).min().date()
+        date_max = pd.to_datetime(wide["Date"]).max().date()
+        n_dst_in_range = sum(
+            date_min <= d <= date_max
+            for d in dst_days
+        )
+        unexpected = nan_cols[nan_cols.index != "X3"]
+        assert len(unexpected) == 0, (
+            f"{node}: unexpected NaN values in non-DST columns: "
+            f"{unexpected.to_dict()}"
+        )
+        assert nan_cols.get("X3", 0) == n_dst_in_range, (
+            f"{node}: expected {n_dst_in_range} NaN in X3 "
+            f"(DST days), got {nan_cols.get('X3', 0)}"
+        )
+        print(f"  {node:20s} → {n_rows:,} days × {n_cols} cols "
+              f"[X3 NaN on {nan_cols.get('X3',0)} DST day(s) — expected]")
+    else:
+        print(f"  {node:20s} → {n_rows:,} days × {n_cols} cols")
+
+    # Write CSV
     filename  = f"spot_{node}.csv"
     file_path = os.path.join(SPOT_DIR, filename)
     wide.to_csv(file_path, index=False)
     files_written.append(file_path)
 
-# --- Confirm all 15 files were written ---
+# --- Confirm all 15 files written ---
 print(f"\nFiles written : {len(files_written)}")
 assert len(files_written) == 15, \
     f"Expected 15 files, wrote {len(files_written)}"
-
 for fp in files_written:
     assert os.path.exists(fp), f"File not found after write: {fp}"
-
 print("Validation passed: all 15 files confirmed on disk.")
 
-# --- Spot-check one file to verify format ---
+# --- Spot-check one file ---
 print("\nSpot-check — first 2 rows of spot_HB_BUSAVG.csv:")
 check = pd.read_csv(os.path.join(SPOT_DIR, "spot_HB_BUSAVG.csv"))
 print(check.head(2).to_string(index=False))
@@ -718,21 +746,384 @@ print(f"Shape: {check.shape[0]:,} rows × {check.shape[1]} columns")
 
 # =============================================================================
 # ANALYTICAL NOTE:
-# The wide format (one row per day, X1–X24 columns) is the standard input
-# structure for many energy simulation and forward curve models, including
-# cQuant's. It allows the model to read a full day's price profile as a
-# single record — useful for capturing intraday shape (the hourly price curve)
-# alongside the daily level.
+# DST spring-forward days are a known data characteristic in all North
+# American power markets. On the second Sunday of March, clocks jump from
+# 02:00 to 03:00 — the 02:00 hour physically does not exist.
+# In ERCOT DA prices, this hour is simply absent from the dataset.
+# After pivoting to wide format, this appears as NaN in the X3 column
+# (the 02:00–03:00 slot) on those 4 days.
 #
-# Hour-beginning convention is standard in ERCOT and most North American
-# ISOs: X1 represents the price for energy delivered in the hour that BEGINS
-# at midnight (00:00–01:00), not ending at midnight.
-#
-# HB_PAN will have fewer rows than other nodes (9 months vs 4 full years)
-# which is expected and consistent with our findings in Tasks 2 and 4.
-#
-# Downstream model note: if the simulation model requires a balanced panel
-# (all nodes covering identical date ranges), HB_PAN may need to be excluded
-# or its missing dates filled — that decision belongs to the model operator,
-# not the data preparation step.
+# How models typically handle DST NaNs:
+#   1. Leave as NaN and let the model skip that hour (our approach)
+#   2. Forward-fill X3 from X2 (conservative — assumes prices held steady)
+#   3. Interpolate between X2 and X4 (smoother but adds synthetic data)
+# Option 1 is the most transparent for a data preparation step —
+# we do not fabricate prices that never existed in the market.
+# The model operator can decide how to handle missing DST hours downstream.
 # =============================================================================
+
+# =============================================================================
+# BONUS — Monthly average price line plots
+#         Plot 1: All settlement hubs (HB_) — one curve per hub
+#         Plot 2: All load zones (LZ_)      — one curve per load zone
+#         X-axis: chronological date (first day of each month)
+#         Saved as PNG to OUTPUT_DIR
+# =============================================================================
+
+#%%
+# --- Load monthly averages from Task 3 ---
+print("Loading AveragePriceByMonth.csv from Task 3...")
+df = pd.read_csv(os.path.join(OUTPUT_DIR, "AveragePriceByMonth.csv"))
+print(f"  Loaded {df.shape[0]:,} rows × {df.shape[1]} columns")
+
+# === BONUS: MEAN PRICE LINE PLOTS ===
+
+# --- Create a proper date column for the x-axis ---
+# Assign each month to its first day so matplotlib can plot chronologically
+# e.g. Year=2016, Month=1 → 2016-01-01
+df["Date"] = pd.to_datetime(
+    df["Year"].astype(str) + "-" +
+    df["Month"].astype(str).str.zfill(2) + "-01"
+)
+
+# --- Split into hubs and load zones ---
+hubs  = df[df["SettlementPoint"].str.startswith("HB_")]
+zones = df[df["SettlementPoint"].str.startswith("LZ_")]
+
+print(f"\nHubs to plot      : {sorted(hubs['SettlementPoint'].unique())}")
+print(f"Load zones to plot: {sorted(zones['SettlementPoint'].unique())}")
+
+# --- Shared plot settings ---
+# Use a colormap with enough distinct colors for up to 8 nodes per plot
+HUB_CMAP  = plt.cm.tab10
+ZONE_CMAP = plt.cm.tab10
+
+def make_avg_price_plot(data, title, filename, cmap):
+    """
+    Plot monthly average price curves for each settlement point in `data`.
+    One curve per SettlementPoint, colored by cmap, saved to OUTPUT_DIR.
+    """
+    nodes     = sorted(data["SettlementPoint"].unique())
+    n_nodes   = len(nodes)
+    colors    = [cmap(i / n_nodes) for i in range(n_nodes)]
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+
+    for i, node in enumerate(nodes):
+        node_data = data[data["SettlementPoint"] == node].sort_values("Date")
+        ax.plot(
+            node_data["Date"],
+            node_data["AveragePrice"],
+            label=node,
+            color=colors[i],
+            linewidth=1.8,
+            marker="o",
+            markersize=3
+        )
+
+    # --- Axes formatting ---
+    ax.set_title(title, fontsize=14, fontweight="bold", pad=15)
+    ax.set_xlabel("Month", fontsize=11)
+    ax.set_ylabel("Average Price ($/MWh)", fontsize=11)
+
+    # Show one x-tick per quarter (every 3 months) to avoid crowding
+    ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=[1, 4, 7, 10]))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    plt.xticks(rotation=45, ha="right", fontsize=8)
+
+    # Add minor ticks for every month (no label) so grid aligns to months
+    ax.xaxis.set_minor_locator(mdates.MonthLocator())
+
+    ax.grid(axis="y", linestyle="--", alpha=0.5)
+    ax.grid(axis="x", which="minor", linestyle=":", alpha=0.3)
+
+    # Place legend outside the plot area so it doesn't obscure curves
+    ax.legend(
+        title="Settlement Point",
+        bbox_to_anchor=(1.01, 1),
+        loc="upper left",
+        fontsize=9,
+        title_fontsize=10,
+        framealpha=0.9
+    )
+
+    # Add a note about HB_PAN partial history if it's in this plot
+    if "HB_PAN" in data["SettlementPoint"].values:
+        ax.annotate(
+            "HB_PAN: partial history (9 months in 2019 only)",
+            xy=(0.01, 0.02), xycoords="axes fraction",
+            fontsize=8, color="gray", style="italic"
+        )
+
+    plt.tight_layout()
+
+    # Save and close
+    out_path = os.path.join(OUTPUT_DIR, filename)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    assert os.path.exists(out_path), f"Plot file not created: {out_path}"
+    print(f"  Saved → {out_path}")
+    return out_path
+
+# --- Plot 1: Settlement Hubs ---
+print("\nGenerating hub plot...")
+make_avg_price_plot(
+    data     = hubs,
+    title    = "ERCOT DA Monthly Average Price — Settlement Hubs (2016–2019)",
+    filename = "SettlementHubAveragePriceByMonth.png",
+    cmap     = HUB_CMAP
+)
+
+# --- Plot 2: Load Zones ---
+print("Generating load zone plot...")
+make_avg_price_plot(
+    data     = zones,
+    title    = "ERCOT DA Monthly Average Price — Load Zones (2016–2019)",
+    filename = "LoadZoneAveragePriceByMonth.png",
+    cmap     = ZONE_CMAP
+)
+
+print("\nBoth plots saved successfully.")
+
+# =============================================================================
+# ANALYTICAL NOTE:
+# These plots reveal several key ERCOT market dynamics:
+#
+# 1. SEASONAL PATTERN: Clear summer peaks (Jul–Aug) each year driven by
+#    Texas heat and AC load, with a secondary winter peak. Spring and fall
+#    show the lowest prices due to mild weather and strong wind output.
+#
+# 2. YEAR-OVER-YEAR TREND: 2018–2019 should show higher peaks than 2016–2017
+#    reflecting both load growth and increased renewable intermittency.
+#
+# 3. HUB vs LOAD ZONE SPREAD: Load zones (LZ_) should track closely with
+#    their corresponding hubs (HB_) but sit slightly higher on average,
+#    reflecting the cost of transmission from generation to load.
+#
+# 4. HB_PAN: Will appear as a short stub in the hub plot starting mid-2019.
+#    Its prices may diverge significantly from other hubs due to wind
+#    oversupply and transmission congestion in the Panhandle region.
+#
+# 5. CONVERGENCE: During low-demand months, hub and load zone prices
+#    converge as transmission constraints relax — visible as tightly
+#    clustered curves in spring/fall months.
+# =============================================================================
+
+# =============================================================================
+# BONUS — Volatility comparison plots across settlement hubs by year
+#         Plot 1: Grouped bar chart — hubs side by side for each year
+#                 Best for comparing hub rankings within and across years
+#         Plot 2: Heatmap — hubs vs years, color = volatility magnitude
+#                 Best for spotting patterns at a glance across the full matrix
+# =============================================================================
+#%%
+# --- Load volatility data from Task 5 ---
+print("Loading HourlyVolatilityByYear.csv...")
+vol_df = pd.read_csv(os.path.join(OUTPUT_DIR, "HourlyVolatilityByYear.csv"))
+print(f"  Loaded {vol_df.shape[0]} rows × {vol_df.shape[1]} columns")
+
+# Pivot to wide format: rows = SettlementPoint, columns = Year
+# This matrix layout is used by both plots
+vol_pivot = vol_df.pivot(
+    index="SettlementPoint",
+    columns="Year",
+    values="HourlyVolatility"
+)
+
+# Sort hubs by their mean volatility across all years (ascending)
+# so the least volatile hub is at the bottom/left and most volatile at top/right
+vol_pivot = vol_pivot.loc[vol_pivot.mean(axis=1).sort_values().index]
+
+print("\nVolatility matrix (rows=hub, cols=year):")
+print(vol_pivot.round(4).to_string())
+
+years = sorted(vol_df["Year"].unique())
+hubs  = list(vol_pivot.index)
+
+# =============================================================================
+# PLOT 1: Grouped bar chart
+# Each year is a group of bars, one bar per hub within the group
+# Makes it easy to compare hub rankings within a year and trends over time
+# =============================================================================
+print("\nGenerating Plot 1: Grouped bar chart...")
+
+n_hubs  = len(hubs)
+n_years = len(years)
+
+# Bar positioning: cluster bars by year, offset each hub within the cluster
+bar_width   = 0.11                          # width of each individual bar
+group_gap   = 0.05                          # extra space between year groups
+offsets     = np.arange(n_hubs) * bar_width # offset within each year group
+group_width = n_hubs * bar_width + group_gap
+x_centers   = np.arange(n_years) * group_width   # center of each year group
+
+# One color per hub, consistent across both plots
+cmap   = plt.cm.tab10
+colors = {hub: cmap(i / n_hubs) for i, hub in enumerate(hubs)}
+
+fig1, ax1 = plt.subplots(figsize=(14, 6))
+
+for i, hub in enumerate(hubs):
+    # x position for this hub's bar in each year group
+    x_positions = x_centers + offsets[i] - (n_hubs * bar_width / 2)
+    values = [vol_pivot.loc[hub, yr] if yr in vol_pivot.columns
+              else 0 for yr in years]
+
+    bars = ax1.bar(
+        x_positions,
+        values,
+        width=bar_width * 0.9,    # slight gap between bars
+        label=hub,
+        color=colors[hub],
+        edgecolor="white",
+        linewidth=0.5
+    )
+
+    # Label each bar with its value if it's notably high (> 0.35)
+    # to draw attention to outliers without cluttering all bars
+    for bar, val in zip(bars, values):
+        if val > 0.35:
+            ax1.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + 0.005,
+                f"{val:.3f}",
+                ha="center", va="bottom",
+                fontsize=6.5, fontweight="bold", color="black"
+            )
+
+# X-axis ticks at center of each year group
+ax1.set_xticks(x_centers)
+ax1.set_xticklabels([str(yr) for yr in years], fontsize=11)
+ax1.set_xlabel("Year", fontsize=11)
+ax1.set_ylabel("Hourly Volatility (σ of log returns)", fontsize=11)
+ax1.set_title(
+    "ERCOT DA Hourly Price Volatility by Settlement Hub and Year",
+    fontsize=13, fontweight="bold", pad=12
+)
+ax1.grid(axis="y", linestyle="--", alpha=0.5)
+ax1.set_ylim(0, vol_pivot.max().max() * 1.15)   # headroom for labels
+
+# Legend outside plot area
+ax1.legend(
+    title="Settlement Hub",
+    bbox_to_anchor=(1.01, 1),
+    loc="upper left",
+    fontsize=9,
+    title_fontsize=10,
+    framealpha=0.9
+)
+
+# Annotate HB_PAN as partial year
+ax1.annotate(
+    "HB_PAN: 2019 only (9 months of data)",
+    xy=(0.01, 0.96), xycoords="axes fraction",
+    fontsize=8, color="gray", style="italic"
+)
+
+plt.tight_layout()
+out1 = os.path.join(OUTPUT_DIR, "VolatilityByHub_BarChart.png")
+fig1.savefig(out1, dpi=150, bbox_inches="tight")
+plt.close(fig1)
+assert os.path.exists(out1)
+print(f"  Saved → {out1}")
+
+# =============================================================================
+# PLOT 2: Heatmap
+# Rows = hubs (sorted by mean volatility), columns = years
+# Color intensity = volatility magnitude
+# Makes the full hub × year matrix readable at a glance
+# NaN cells (HB_PAN missing years) shown in light gray
+# =============================================================================
+print("Generating Plot 2: Heatmap...")
+
+fig2, ax2 = plt.subplots(figsize=(8, 6))
+
+# Build the matrix as a numpy array for imshow
+matrix = vol_pivot.values.astype(float)   # shape: (n_hubs, n_years)
+
+# Use a masked array so NaN cells (HB_PAN missing years) render as gray
+masked = np.ma.masked_invalid(matrix)
+
+# Color scale: white = low volatility, deep red = high volatility
+cmap_heat = plt.cm.YlOrRd
+cmap_heat.set_bad(color="#d0d0d0")   # gray for NaN cells
+
+im = ax2.imshow(
+    masked,
+    cmap=cmap_heat,
+    aspect="auto",
+    vmin=0,
+    vmax=vol_pivot.max().max()
+)
+
+# Axis labels
+ax2.set_xticks(range(n_years))
+ax2.set_xticklabels([str(yr) for yr in years], fontsize=11)
+ax2.set_yticks(range(len(hubs)))
+ax2.set_yticklabels(hubs, fontsize=10)
+ax2.set_xlabel("Year", fontsize=11)
+ax2.set_ylabel("Settlement Hub", fontsize=11)
+ax2.set_title(
+    "ERCOT DA Hourly Volatility Heatmap\nSettlement Hubs × Year",
+    fontsize=13, fontweight="bold", pad=12
+)
+
+# Annotate each cell with its numeric value
+for row_idx in range(len(hubs)):
+    for col_idx in range(n_years):
+        val = matrix[row_idx, col_idx]
+        if not np.isnan(val):
+            # Use white text on dark cells, black on light cells for readability
+            text_color = "white" if val > 0.35 else "black"
+            ax2.text(
+                col_idx, row_idx,
+                f"{val:.3f}",
+                ha="center", va="center",
+                fontsize=9, color=text_color, fontweight="bold"
+            )
+        else:
+            ax2.text(
+                col_idx, row_idx, "N/A",
+                ha="center", va="center",
+                fontsize=9, color="#888888"
+            )
+
+# Colorbar
+cbar = fig2.colorbar(im, ax=ax2, shrink=0.8, pad=0.02)
+cbar.set_label("Hourly Volatility (σ of log returns)", fontsize=10)
+
+plt.tight_layout()
+out2 = os.path.join(OUTPUT_DIR, "VolatilityByHub_Heatmap.png")
+fig2.savefig(out2, dpi=150, bbox_inches="tight")
+plt.close(fig2)
+assert os.path.exists(out2)
+print(f"  Saved → {out2}")
+
+print("\nBoth volatility plots saved successfully.")
+
+# =============================================================================
+# ANALYTICAL NOTE:
+# Two complementary visualizations are used because each answers a different
+# question:
+#
+# Bar chart: "How does each hub rank relative to others within a given year?"
+#   → Easy to see that HB_WEST and HB_PAN dominate, and that 2019 was
+#     the most volatile year across almost all hubs
+#
+# Heatmap: "What is the overall pattern across the full hub × year matrix?"
+#   → Immediately shows the top-right corner (HB_WEST/HB_PAN, 2019) as the
+#     hottest cell, and the bottom-left (HB_NORTH, 2017) as the coolest —
+#     the volatility gradient is visible at a glance
+#
+# Key findings:
+#   - Volatility increased year-over-year from 2017→2019 for all hubs,
+#     consistent with rising renewable penetration in ERCOT
+#   - HB_WEST is persistently the most volatile full-history hub —
+#     West Texas wind intermittency is a structural feature, not a one-off
+#   - HB_PAN's 0.632 in 2019 is an outlier — partially explained by it
+#     being a partial year, but also reflective of extreme Panhandle wind
+#   - HB_NORTH consistently shows the lowest volatility — the Dallas/Fort
+#     Worth load center is well-connected and transmission-unconstrained
+# =============================================================================
+
