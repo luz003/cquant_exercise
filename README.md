@@ -8,26 +8,26 @@
 ---
 
 ## Project Structure
-cquant_exercise/
-├── main.py                        # All analysis code (cell-per-task structure)
-├── historicalPriceData/           # Input CSVs (4 files, 2016–2019)
-│   ├── ERCOT_DA_Prices_2016.csv
-│   ├── ERCOT_DA_Prices_2017.csv
-│   ├── ERCOT_DA_Prices_2018.csv
-│   └── ERCOT_DA_Prices_2019.csv
-└── output/                        # All generated outputs
-├── AveragePriceByMonth.csv
-├── HourlyVolatilityByYear.csv
-├── MaxVolatilityByYear.csv
-├── OU_parameters_by_hub.csv
-├── SettlementHubAveragePriceByMonth.png
-├── LoadZoneAveragePriceByMonth.png
-├── VolatilityByHub_BarChart.png
-├── VolatilityByHub_Heatmap.png
-├── OU_MeanReversion_Analysis.png
-├── formattedSpotHistory/      # 15 spot_<node>.csv files
-└── hourlyShapeProfiles/       # 15 profile_<node>.csv files
 
+    cquant_exercise/
+    ├── main.py                        # All analysis code
+    ├── historicalPriceData/           # Input CSVs (4 files, 2016–2019)
+    │   ├── ERCOT_DA_Prices_2016.csv
+    │   ├── ERCOT_DA_Prices_2017.csv
+    │   ├── ERCOT_DA_Prices_2018.csv
+    │   └── ERCOT_DA_Prices_2019.csv
+    └── output/                        # All generated outputs
+        ├── AveragePriceByMonth.csv
+        ├── HourlyVolatilityByYear.csv
+        ├── MaxVolatilityByYear.csv
+        ├── OU_parameters_by_hub.csv
+        ├── SettlementHubAveragePriceByMonth.png
+        ├── LoadZoneAveragePriceByMonth.png
+        ├── VolatilityByHub_BarChart.png
+        ├── VolatilityByHub_Heatmap.png
+        ├── OU_MeanReversion_Analysis.png
+        ├── formattedSpotHistory/      # 15 spot_<node>.csv files
+        └── hourlyShapeProfiles/       # 15 profile_<node>.csv files
 ---
 
 ## Dependencies
