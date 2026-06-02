@@ -4,8 +4,9 @@
 # Date: 06/02/2026
 # ============================================================
 
+# %%
 # --- SYSTEM PARAMETERS — UPDATE THESE BEFORE RUNNING ---
-DATA_DIR = "data/"
+DATA_DIR = "historicalPriceData/"
 OUTPUT_DIR = "output/"
 
 # --- REQUIRED PACKAGES ---
@@ -37,3 +38,5 @@ print(f"Saving outputs to: {OUTPUT_DIR}")
 # ============================================================
 
 # your code here
+
+# %%
