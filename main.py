@@ -1,7 +1,7 @@
 # ============================================================
 # cQuant Energy Analyst Exercise
 # Author: Luyang Zhang
-# Date: [date of exercise]
+# Date: 06/02/2026
 # ============================================================
 
 # --- SYSTEM PARAMETERS — UPDATE THESE BEFORE RUNNING ---
