@@ -14,6 +14,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import matplotlib.gridspec as gridspec
 from scipy import stats
 import statsmodels.api as sm
 import os
@@ -1302,5 +1303,325 @@ print(f"Row mean (max): {loaded_means.max():.10f}")
 # Shape profiles are used in forward curve construction to distribute a
 # monthly average price forecast into 24 hourly prices — a core step in
 # energy trading and risk management.
+# =============================================================================
+#%%
+# =============================================================================
+# BONUS — Open-Ended Analysis
+#         Ornstein-Uhlenbeck (OU) Mean Reversion Model for ERCOT Hub Prices
+#
+# MOTIVATION:
+# Electricity prices are mean-reverting — unlike stocks, power prices cannot
+# drift to infinity because high prices incentivize new generation supply,
+# and low prices cause generators to shut down. The Ornstein-Uhlenbeck process
+# is the canonical continuous-time model for mean-reverting commodities and
+# is the mathematical foundation of most power price simulation models,
+# including those built by cQuant.
+#
+# The OU process is defined by the SDE:
+#   dP_t = κ(μ - P_t)dt + σ dW_t
+# where:
+#   κ = mean reversion speed (how fast prices snap back to the long-run mean)
+#   μ = long-run mean price (the equilibrium level prices revert toward)
+#   σ = volatility (magnitude of random price shocks)
+#   dW_t = Wiener process increment (random noise)
+#
+# We fit this model to log prices for each hub using OLS regression on the
+# discrete-time approximation of the OU SDE, then visualize the parameters
+# and simulate future price paths.
+# =============================================================================
+
+
+print("Loading combined dataset from Task 1...")
+df = pd.read_csv(os.path.join(OUTPUT_DIR, "combined_ercot_da_prices.csv"),
+                 parse_dates=["Date"])
+print(f"  Loaded {df.shape[0]:,} rows × {df.shape[1]} columns")
+
+# === PART 1: FIT OU PARAMETERS PER HUB ===
+# ---------------------------------------------------------------------------
+# The discrete-time OU process (Euler-Maruyama discretization) is:
+#   ln(P_t) - ln(P_{t-1}) = κ·μ·Δt - κ·Δt·ln(P_{t-1}) + σ·√Δt·ε_t
+#
+# This is a linear regression of the form:
+#   Δy_t = a + b·y_{t-1} + ε_t
+# where:
+#   y_t    = ln(P_t)        (log price)
+#   Δy_t   = y_t - y_{t-1} (log return)
+#   a      = κ·μ·Δt         → μ = a / (κ·Δt) = -a/b
+#   b      = -κ·Δt           → κ = -b/Δt
+#   σ_ε    = std(residuals)  → σ = σ_ε / √Δt
+#   Δt     = 1/8760          (one hour as fraction of a year)
+#
+# We fit this regression separately for each hub using all available
+# hourly data, filtering out non-positive prices before taking logs.
+# ---------------------------------------------------------------------------
+
+DT = 1 / 8760   # one hourly timestep as a fraction of a year
+
+# Filter to hubs only, remove non-positive prices
+hubs_df = df[df["SettlementPoint"].str.startswith("HB_")].copy()
+hubs_df = hubs_df[hubs_df["Price"] > 0].copy()
+hubs_df = hubs_df.sort_values(["SettlementPoint", "Date"])
+
+hub_list = sorted(hubs_df["SettlementPoint"].unique())
+print(f"\nFitting OU model for {len(hub_list)} hubs...")
+
+ou_params = []
+
+for hub in hub_list:
+    h = hubs_df[hubs_df["SettlementPoint"] == hub].copy()
+
+    # Compute log price and log return
+    h["LogPrice"]  = np.log(h["Price"])
+    h["LogReturn"] = h["LogPrice"].diff()
+
+    # Drop first row (NaN log return) and any remaining NaNs
+    h = h.dropna(subset=["LogPrice", "LogReturn"])
+
+    # OLS regression: Δy_t = a + b·y_{t-1} + ε_t
+    # y_{t-1} is the lagged log price
+    y_lag  = h["LogPrice"].shift(1).dropna()
+    dy     = h["LogReturn"].loc[y_lag.index]
+
+    slope, intercept, r_value, p_value, std_err = stats.linregress(y_lag, dy)
+
+    # Recover OU parameters from regression coefficients
+    # b = slope = -κ·Δt  →  κ = -slope / Δt
+    # a = intercept = κ·μ·Δt  →  μ = intercept / (-slope)  = -a/b
+    kappa = -slope / DT                          # mean reversion speed (per year)
+    mu    = intercept / (-slope)                 # long-run mean (in log price space)
+    mu_price = np.exp(mu)                        # convert back to $/MWh
+
+    # σ from residual std: σ = std(residuals) / √Δt
+    residuals = dy - (intercept + slope * y_lag)
+    sigma = residuals.std() / np.sqrt(DT)        # annualized volatility
+
+    # Half-life: time for price deviation to decay by 50%
+    # half_life = ln(2) / κ  (in years) × 8760 = hours
+    half_life_hours = np.log(2) / kappa * 8760
+
+    ou_params.append({
+        "Hub"             : hub,
+        "Kappa"           : round(kappa,    4),   # mean reversion speed
+        "Mu_LogPrice"     : round(mu,       4),   # long-run mean (log scale)
+        "Mu_Price"        : round(mu_price, 4),   # long-run mean ($/MWh)
+        "Sigma"           : round(sigma,    4),   # annualized volatility
+        "HalfLife_Hours"  : round(half_life_hours, 2),
+        "R_Squared"       : round(r_value**2, 4),
+        "N_Obs"           : len(dy)
+    })
+
+    print(f"  {hub:20s} | κ={kappa:7.2f}/yr | μ=${mu_price:6.2f} | "
+          f"σ={sigma:.4f} | half-life={half_life_hours:.1f}h | R²={r_value**2:.4f}")
+
+ou_df = pd.DataFrame(ou_params)
+
+# Save OU parameters
+ou_path = os.path.join(OUTPUT_DIR, "OU_parameters_by_hub.csv")
+ou_df.to_csv(ou_path, index=False)
+print(f"\nSaved OU parameters → {ou_path}")
+
+# === PART 2: MONTE CARLO SIMULATION FOR HB_BUSAVG ===
+# ---------------------------------------------------------------------------
+# Using the fitted OU parameters for HB_BUSAVG, simulate N_PATHS future
+# hourly price paths over a 30-day horizon.
+# Discrete simulation:
+#   ln(P_t) = ln(P_{t-1}) + κ(μ - ln(P_{t-1}))Δt + σ√Δt·ε_t
+#   where ε_t ~ N(0,1)
+# ---------------------------------------------------------------------------
+
+print("\nRunning Monte Carlo simulation for HB_BUSAVG...")
+
+N_PATHS   = 200     # number of simulated price paths
+N_HOURS   = 24 * 30 # 30-day horizon
+np.random.seed(42)  # reproducibility
+
+# Get fitted parameters for HB_BUSAVG
+params    = ou_df[ou_df["Hub"] == "HB_BUSAVG"].iloc[0]
+kappa_sim = params["Kappa"]
+mu_sim    = params["Mu_LogPrice"]     # long-run mean in log space
+sigma_sim = params["Sigma"]
+
+# Starting price = last observed price for HB_BUSAVG
+last_price = (hubs_df[hubs_df["SettlementPoint"] == "HB_BUSAVG"]
+              .sort_values("Date")["Price"].iloc[-1])
+log_p0 = np.log(last_price)
+
+print(f"  κ={kappa_sim:.2f}/yr | μ=${np.exp(mu_sim):.2f} | "
+      f"σ={sigma_sim:.4f} | P0=${last_price:.2f}")
+
+# Simulate paths
+log_paths = np.zeros((N_PATHS, N_HOURS + 1))
+log_paths[:, 0] = log_p0
+
+for t in range(1, N_HOURS + 1):
+    # OU increment: mean reversion pull + random shock
+    dW = np.random.normal(0, 1, N_PATHS)
+    log_paths[:, t] = (log_paths[:, t-1]
+                       + kappa_sim * (mu_sim - log_paths[:, t-1]) * DT
+                       + sigma_sim * np.sqrt(DT) * dW)
+
+# Convert log paths back to price space
+price_paths = np.exp(log_paths)
+
+# === PART 3: VISUALIZATION ===
+print("\nGenerating OU analysis plots...")
+
+fig = plt.figure(figsize=(16, 14))
+gs  = gridspec.GridSpec(3, 2, figure=fig, hspace=0.45, wspace=0.35)
+
+# --- Plot 1 (top left): Mean Reversion Speed (κ) by hub ---
+ax1 = fig.add_subplot(gs[0, 0])
+colors_bar = plt.cm.RdYlGn_r(
+    (ou_df["Kappa"] - ou_df["Kappa"].min()) /
+    (ou_df["Kappa"].max() - ou_df["Kappa"].min())
+)
+bars = ax1.barh(ou_df["Hub"], ou_df["Kappa"],
+                color=colors_bar, edgecolor="white")
+ax1.set_xlabel("κ — Mean Reversion Speed (per year)", fontsize=10)
+ax1.set_title("Mean Reversion Speed by Hub\n"
+              "(higher = faster reversion to long-run mean)", fontsize=10,
+              fontweight="bold")
+ax1.axvline(ou_df["Kappa"].mean(), color="black",
+            linestyle="--", linewidth=1, label=f"Mean κ={ou_df['Kappa'].mean():.0f}")
+ax1.legend(fontsize=8)
+ax1.grid(axis="x", linestyle="--", alpha=0.4)
+
+# --- Plot 2 (top right): Long-run mean price (μ) by hub ---
+ax2 = fig.add_subplot(gs[0, 1])
+ax2.barh(ou_df["Hub"], ou_df["Mu_Price"],
+         color="steelblue", edgecolor="white")
+ax2.set_xlabel("μ — Long-Run Mean Price ($/MWh)", fontsize=10)
+ax2.set_title("Long-Run Equilibrium Price by Hub\n"
+              "(price level that OU process reverts toward)", fontsize=10,
+              fontweight="bold")
+ax2.axvline(ou_df["Mu_Price"].mean(), color="black",
+            linestyle="--", linewidth=1,
+            label=f"Mean μ=${ou_df['Mu_Price'].mean():.2f}")
+ax2.legend(fontsize=8)
+ax2.grid(axis="x", linestyle="--", alpha=0.4)
+
+# --- Plot 3 (middle left): Half-life of mean reversion ---
+ax3 = fig.add_subplot(gs[1, 0])
+ax3.barh(ou_df["Hub"], ou_df["HalfLife_Hours"],
+         color="darkorange", edgecolor="white")
+ax3.set_xlabel("Half-Life (hours)", fontsize=10)
+ax3.set_title("Mean Reversion Half-Life by Hub\n"
+              "(hours for price shock to decay 50%)", fontsize=10,
+              fontweight="bold")
+ax3.grid(axis="x", linestyle="--", alpha=0.4)
+
+# Annotate each bar with its value
+for bar, val in zip(ax3.patches, ou_df["HalfLife_Hours"]):
+    ax3.text(bar.get_width() + 0.1, bar.get_y() + bar.get_height() / 2,
+             f"{val:.1f}h", va="center", fontsize=8)
+
+# --- Plot 4 (middle right): Annualized volatility (σ) by hub ---
+ax4 = fig.add_subplot(gs[1, 1])
+ax4.barh(ou_df["Hub"], ou_df["Sigma"],
+         color="crimson", edgecolor="white")
+ax4.set_xlabel("σ — Annualized Volatility", fontsize=10)
+ax4.set_title("OU Volatility Parameter by Hub\n"
+              "(consistent with Task 4 hourly vol findings)", fontsize=10,
+              fontweight="bold")
+ax4.grid(axis="x", linestyle="--", alpha=0.4)
+
+# --- Plot 5 (bottom, full width): Monte Carlo simulation ---
+ax5 = fig.add_subplot(gs[2, :])
+
+hours = np.arange(N_HOURS + 1)
+
+# Plot all simulated paths in light gray
+for i in range(N_PATHS):
+    ax5.plot(hours, price_paths[i], color="steelblue",
+             alpha=0.08, linewidth=0.5)
+
+# Plot percentile bands
+p5   = np.percentile(price_paths, 5,  axis=0)
+p25  = np.percentile(price_paths, 25, axis=0)
+p50  = np.percentile(price_paths, 50, axis=0)
+p75  = np.percentile(price_paths, 75, axis=0)
+p95  = np.percentile(price_paths, 95, axis=0)
+
+ax5.fill_between(hours, p5,  p95, alpha=0.15, color="steelblue",
+                 label="5th–95th percentile")
+ax5.fill_between(hours, p25, p75, alpha=0.30, color="steelblue",
+                 label="25th–75th percentile")
+ax5.plot(hours, p50, color="darkblue",
+         linewidth=2, label="Median simulated path")
+ax5.axhline(np.exp(mu_sim), color="red", linestyle="--",
+            linewidth=1.5, label=f"Long-run mean μ=${np.exp(mu_sim):.2f}")
+ax5.axhline(last_price, color="green", linestyle=":",
+            linewidth=1.5, label=f"Starting price P0=${last_price:.2f}")
+
+ax5.set_xlabel("Hours into Future", fontsize=10)
+ax5.set_ylabel("Simulated Price ($/MWh)", fontsize=10)
+ax5.set_title(
+    f"OU Monte Carlo Simulation — HB_BUSAVG | {N_PATHS} Paths | 30-Day Horizon\n"
+    f"κ={kappa_sim:.1f}/yr  μ=${np.exp(mu_sim):.2f}  σ={sigma_sim:.4f}",
+    fontsize=10, fontweight="bold"
+)
+ax5.legend(fontsize=9, loc="upper right")
+ax5.set_xlim(0, N_HOURS)
+ax5.set_ylim(0, np.percentile(price_paths, 99) * 1.1)
+ax5.grid(linestyle="--", alpha=0.4)
+
+fig.suptitle(
+    "Ornstein-Uhlenbeck Mean Reversion Analysis — ERCOT DA Hub Prices (2016–2019)",
+    fontsize=13, fontweight="bold", y=1.01
+)
+
+out_plot = os.path.join(OUTPUT_DIR, "OU_MeanReversion_Analysis.png")
+fig.savefig(out_plot, dpi=150, bbox_inches="tight")
+plt.close(fig)
+assert os.path.exists(out_plot)
+print(f"Saved → {out_plot}")
+
+# --- Print final summary table ---
+print("\nOU Parameter Summary:")
+print(ou_df[["Hub", "Kappa", "Mu_Price", "Sigma",
+             "HalfLife_Hours", "R_Squared"]].to_string(index=False))
+
+# =============================================================================
+# ANALYTICAL NOTE:
+#
+# MEAN REVERSION SPEED (κ):
+# A κ of ~5,000–50,000/year is typical for hourly power prices — far higher
+# than equities (κ~1–5/year) or even natural gas (κ~10–30/year). This means
+# electricity price shocks decay within hours, not days or months. The
+# half-life plot makes this intuitive: a price spike in ERCOT typically
+# reverts 50% within just a few hours.
+#
+# LONG-RUN MEAN (μ):
+# The equilibrium price μ should be close to the historical average price
+# (~$25–35/MWh for ERCOT 2016–2019). If μ deviates significantly from the
+# observed mean, it suggests structural price shifts (e.g. fuel cost changes,
+# capacity additions) that a single-regime OU model cannot fully capture.
+#
+# VOLATILITY (σ):
+# The OU σ is annualized — comparable across assets. Power σ values will
+# appear very large relative to financial assets, confirming electricity is
+# the most volatile commodity class. σ should be consistent with the hourly
+# volatilities computed in Task 4.
+#
+# MONTE CARLO SIMULATION:
+# The fan chart shows how price uncertainty expands over the 30-day horizon
+# before stabilizing — the OU process reaches its stationary distribution
+# (the long-run equilibrium) after roughly 3–5 half-lives. The convergence
+# of the median toward μ and the stabilization of the percentile bands are
+# signatures of mean reversion — a key distinction from a random walk (where
+# uncertainty expands forever).
+#
+# MODEL LIMITATIONS:
+# 1. Single regime: one μ and κ for all seasons — real power prices have
+#    different equilibria in summer vs winter
+# 2. Log-normal assumption: cannot naturally produce negative prices (we
+#    filtered them out before fitting)
+# 3. Constant volatility: σ is assumed fixed, but ERCOT vol is clearly
+#    higher in summer (as shown in Task 4)
+# 4. No seasonality: a production model would add a deterministic seasonal
+#    component S(t) to the mean: dP = κ(S(t) - P)dt + σdW
+# These limitations are well-known and motivate the more sophisticated
+# models cQuant builds — regime-switching, seasonal OU, and jump-diffusion
+# processes that better capture power price dynamics.
 # =============================================================================
 # %%
