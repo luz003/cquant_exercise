@@ -1127,3 +1127,180 @@ print("\nBoth volatility plots saved successfully.")
 #     Worth load center is well-connected and transmission-unconstrained
 # =============================================================================
 
+#%%
+# =============================================================================
+# BONUS — Hourly shape profiles by settlement point, month, and day of week
+#         For each (SettlementPoint, Month, DayOfWeek) group:
+#           1. Compute the average price for each of the 24 hours
+#           2. Divide each hour's average by the mean of all 24 averages
+#           → 24 normalized values that average to exactly 1.0
+#         Output: wide format — one row per (Month, DayOfWeek) combination
+#                 columns: Month, DayOfWeek, H1, H2, ..., H24
+#         One CSV per settlement point (15 files total)
+#         Saved in output/hourlyShapeProfiles/
+# =============================================================================
+
+
+PROFILE_DIR = os.path.join(OUTPUT_DIR, "hourlyShapeProfiles")
+
+os.makedirs(PROFILE_DIR, exist_ok=True)
+print(f"Output subdirectory: {PROFILE_DIR}")
+
+# --- Load the combined dataset from Task 1 ---
+print("\nLoading combined dataset from Task 1...")
+df = pd.read_csv(os.path.join(OUTPUT_DIR, "combined_ercot_da_prices.csv"),
+                 parse_dates=["Date"])
+print(f"  Loaded {df.shape[0]:,} rows × {df.shape[1]} columns")
+
+# === BONUS: HOURLY SHAPE PROFILES ===
+
+# --- Extract time components needed for grouping ---
+df["Month"]     = df["Date"].dt.month        # 1–12
+df["DayOfWeek"] = df["Date"].dt.day_name()   # Monday, Tuesday, ..., Sunday
+df["Hour"]      = df["Date"].dt.hour + 1     # 1–24 (hour-beginning convention)
+
+# Define ordered day-of-week list so output rows sort Mon→Sun
+DOW_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday",
+             "Friday", "Saturday", "Sunday"]
+
+# Hour columns in output: H1, H2, ..., H24
+hour_cols = [f"H{h}" for h in range(1, 25)]
+
+# --- Get all settlement points ---
+all_nodes = sorted(df["SettlementPoint"].unique())
+print(f"\nSettlement points to process: {len(all_nodes)}")
+assert len(all_nodes) == 15, \
+    f"Expected 15 settlement points, found {len(all_nodes)}"
+
+EXPECTED_PROFILES = 84   # 12 months × 7 days of week
+files_written = []
+
+for node in all_nodes:
+    node_df = df[df["SettlementPoint"] == node].copy()
+
+    # --- Step 1: Average price by (Month, DayOfWeek, Hour) ---
+    # Computes the mean price for every (month, day-of-week, hour) combination
+    # e.g. average price at H18 across all Mondays in January 2016–2019
+    hourly_avg = (
+        node_df.groupby(["Month", "DayOfWeek", "Hour"])["Price"]
+        .mean()
+        .reset_index()
+        .rename(columns={"Price": "AvgPrice"})
+    )
+
+    # --- Step 2: Pivot to wide format FIRST ---
+    # Rows: (Month, DayOfWeek), Columns: Hour 1–24, Values: AvgPrice
+    # We pivot before normalizing so we can operate on full rows cleanly
+    wide = hourly_avg.pivot(
+        index=["Month", "DayOfWeek"],
+        columns="Hour",
+        values="AvgPrice"
+    )
+
+    # Rename columns from integers (1–24) to H1–H24
+    wide.columns = [f"H{int(h)}" for h in wide.columns]
+
+    # Reorder columns numerically (pivot may sort alphabetically)
+    wide = wide[hour_cols]
+
+    # --- Step 3: Normalize each row so its 24 values average to exactly 1.0 ---
+    # row_means is a Series with one mean per (Month, DayOfWeek) row
+    # Dividing wide by row_means.values[:,None] broadcasts across all 24 columns
+    row_means = wide[hour_cols].mean(axis=1)
+    wide[hour_cols] = wide[hour_cols].div(row_means, axis=0)
+
+    # Reset index so Month and DayOfWeek become regular columns
+    wide = wide.reset_index()
+
+    # Sort rows: Month 1–12, within each month Monday→Sunday
+    wide["DayOfWeek"] = pd.Categorical(
+        wide["DayOfWeek"], categories=DOW_ORDER, ordered=True
+    )
+    wide = wide.sort_values(["Month", "DayOfWeek"]).reset_index(drop=True)
+
+# --- Validate shape ---
+    # HB_PAN only has 9 months of data so it will have fewer than 84 profiles
+    # For all other nodes, exactly 84 (12 months × 7 days) are required
+    if node == "HB_PAN":
+        assert wide.shape[0] <= EXPECTED_PROFILES, (
+            f"{node}: expected at most {EXPECTED_PROFILES} rows, "
+            f"got {wide.shape[0]}"
+        )
+        print(f"  ⚠ HB_PAN: {wide.shape[0]} profiles (partial history — "
+              f"{wide.shape[0] // 7} months of data, expected 9)")
+    else:
+        assert wide.shape[0] == EXPECTED_PROFILES, (
+            f"{node}: expected {EXPECTED_PROFILES} rows, got {wide.shape[0]}"
+        )
+    assert wide.shape[1] == 26, (
+        f"{node}: expected 26 columns (Month, DayOfWeek, H1–H24), "
+        f"got {wide.shape[1]}"
+    )
+
+    # --- Validate normalization: every row mean must equal exactly 1.0 ---
+    row_means_check = wide[hour_cols].mean(axis=1)
+    max_deviation = (row_means_check - 1.0).abs().max()
+    assert max_deviation < 1e-10, \
+        f"{node}: normalization failed — max deviation from 1.0: {max_deviation:.2e}"
+
+    # --- Check for NaN values ---
+    n_nan = wide[hour_cols].isna().sum().sum()
+    if n_nan > 0:
+        print(f"  ⚠ {node}: {n_nan} NaN shape values — partial history node")
+
+    print(f"  {node:20s} → {wide.shape[0]} profiles × {wide.shape[1]} columns "
+          f"| max normalization error: {max_deviation:.2e}")
+
+    # --- Save ---
+    filename  = f"profile_{node}.csv"
+    file_path = os.path.join(PROFILE_DIR, filename)
+    wide.to_csv(file_path, index=False)
+    files_written.append(file_path)
+
+# --- Confirm all 15 files written ---
+print(f"\nFiles written: {len(files_written)}")
+assert len(files_written) == 15, \
+    f"Expected 15 files, wrote {len(files_written)}"
+for fp in files_written:
+    assert os.path.exists(fp), f"File not found: {fp}"
+print("Validation passed: all 15 files confirmed on disk.")
+
+# --- Spot-check: first 3 rows of HB_BUSAVG profile ---
+print("\nSpot-check — first 3 rows of profile_HB_BUSAVG.csv:")
+check = pd.read_csv(os.path.join(PROFILE_DIR, "profile_HB_BUSAVG.csv"))
+print(check.head(3).to_string(index=False))
+print(f"\nShape: {check.shape[0]} rows × {check.shape[1]} columns")
+
+hour_cols_check = [f"H{h}" for h in range(1, 25)]
+loaded_means = check[hour_cols_check].mean(axis=1)
+print(f"Row mean (min): {loaded_means.min():.10f}")
+print(f"Row mean (max): {loaded_means.max():.10f}")
+
+# =============================================================================
+# ANALYTICAL NOTE:
+# Wide format (one row per Month-DayOfWeek pair, H1–H24 as columns) was
+# chosen over long format for two reasons:
+#   1. It mirrors the cQuant model-ready convention established in Task 7
+#      (Variable, Date, X1–X24), making the files consistent across the
+#      submission and easy for a model to ingest row by row
+#   2. Each row is a complete 24-hour shape profile — a self-contained
+#      record that can be read, plotted, or applied without any further
+#      pivoting
+#
+# Interpretation of shape values:
+#   - ShapeValue > 1.0: this hour is more expensive than the daily average
+#   - ShapeValue < 1.0: this hour is cheaper than the daily average
+#   - ShapeValue = 1.0: this hour matches the daily average exactly
+#
+# Expected patterns in ERCOT:
+#   - Weekday profiles: morning ramp (H7–H9 rising), evening peak (H18–H20),
+#     overnight trough (H1–H5 lowest shape values ~0.7–0.8)
+#   - Weekend profiles: flatter shape, lower peak-to-trough ratio
+#   - Summer months (7–8): most pronounced peak shape, driven by AC load
+#   - Spring/fall months (3–5, 9–10): flattest profiles, mild demand
+#
+# Shape profiles are used in forward curve construction to distribute a
+# monthly average price forecast into 24 hourly prices — a core step in
+# energy trading and risk management.
+# =============================================================================
+# %%
